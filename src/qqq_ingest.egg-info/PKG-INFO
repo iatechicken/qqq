@@ -1,0 +1,10 @@
+Metadata-Version: 2.4
+Name: qqq-ingest
+Version: 0.0.1
+Requires-Python: >=3.10
+Requires-Dist: pandas
+Requires-Dist: pyarrow
+Requires-Dist: pytz
+Requires-Dist: python-dateutil
+Requires-Dist: tqdm
+Requires-Dist: numpy

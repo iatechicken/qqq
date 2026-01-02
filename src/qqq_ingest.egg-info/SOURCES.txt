@@ -1,0 +1,12 @@
+pyproject.toml
+src/qqq_ingest/__init__.py
+src/qqq_ingest/fetchers.py
+src/qqq_ingest/ingest.py
+src/qqq_ingest/qc.py
+src/qqq_ingest/storage.py
+src/qqq_ingest/timeutil.py
+src/qqq_ingest.egg-info/PKG-INFO
+src/qqq_ingest.egg-info/SOURCES.txt
+src/qqq_ingest.egg-info/dependency_links.txt
+src/qqq_ingest.egg-info/requires.txt
+src/qqq_ingest.egg-info/top_level.txt
