@@ -1,8 +1,16 @@
+certifi==2026.1.4
+charset-normalizer==3.4.4
+idna==3.11
 numpy==2.4.0
 pandas==2.3.3
 pyarrow==22.0.0
 python-dateutil==2.9.0.post0
+python-dotenv==1.2.1
 pytz==2025.2
+-e git+https://github.com/iatechicken/qqq.git@f5dc43ffad1d05222a6b70aa30017ee80ae18c3f#egg=qqq_ingest
+requests==2.32.5
+setuptools==80.9.0
 six==1.17.0
 tqdm==4.67.1
 tzdata==2025.3
+urllib3==2.6.3
