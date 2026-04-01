@@ -94,3 +94,57 @@ class SchwabPriceHistoryFetcher:
         df["ts_utc"] = pd.to_datetime(df["datetime"], unit="ms", utc=True)
         df = df.rename(columns={"volume": "volume"})  # keep explicit
         return df[["ts_utc","open","high","low","close","volume"]].copy()
+
+
+@dataclass
+class SchwabDailyFetcher:
+    """Fetch daily candles from Schwab Price History API.
+
+    Chunks requests into 1-year windows because Schwab rejects large ranges.
+    """
+    chunk_days: int = 365
+
+    def _fetch_chunk(self, symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
+        token = get_access_token()
+        params = {
+            "symbol": symbol,
+            "periodType": "year",
+            "frequencyType": "daily",
+            "frequency": 1,
+            "startDate": str(_epoch_ms(start)),
+            "endDate": str(_epoch_ms(end)),
+        }
+        r = requests.get(
+            PRICEHISTORY_URL,
+            headers={"Authorization": f"Bearer {token}"},
+            params=params,
+            timeout=30,
+        )
+        if r.status_code != 200:
+            print(f"  Schwab API error {r.status_code}: {r.text[:300]}")
+            r.raise_for_status()
+        j = r.json()
+        candles = j.get("candles", [])
+        if not candles:
+            return pd.DataFrame(columns=["date","open","high","low","close","volume"])
+
+        df = pd.DataFrame(candles)
+        df["date"] = pd.to_datetime(df["datetime"], unit="ms", utc=True).dt.tz_convert("US/Eastern").dt.date
+        return df[["date","open","high","low","close","volume"]].copy()
+
+    def fetch(self, symbol: str, start_utc: datetime, end_utc: datetime) -> pd.DataFrame:
+        from datetime import timedelta
+        frames = []
+        cur = start_utc
+        while cur < end_utc:
+            nxt = min(cur + timedelta(days=self.chunk_days), end_utc)
+            print(f"  Chunk: {cur.date()} -> {nxt.date()}")
+            chunk = self._fetch_chunk(symbol, cur, nxt)
+            if not chunk.empty:
+                frames.append(chunk)
+            cur = nxt
+        if not frames:
+            return pd.DataFrame(columns=["date","open","high","low","close","volume"])
+        df = pd.concat(frames, ignore_index=True)
+        df = df.drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
+        return df
