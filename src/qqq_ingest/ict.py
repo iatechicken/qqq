@@ -1151,7 +1151,13 @@ def _evaluate_bear_setups(df, price, atr, obs, fvgs, struct_levels,
             warnings=warnings,
         ))
 
-    return setups
+    # Deduplicate: keep the highest-conviction setup per unique level
+    seen = {}
+    for s in setups:
+        key = round(s.entry_top, 2)
+        if key not in seen or s.conviction > seen[key].conviction:
+            seen[key] = s
+    return list(seen.values())
 
 
 def _evaluate_bull_setups(df, price, atr, obs, fvgs, struct_levels,
@@ -1262,3 +1268,232 @@ def _evaluate_bull_setups(df, price, atr, obs, fvgs, struct_levels,
         ))
 
     return setups
+
+
+# ---------------------------------------------------------------------------
+# IWM-specific setup evaluation — recalibrated from 500-day IWM backtest
+# ---------------------------------------------------------------------------
+
+def evaluate_setups_iwm(df: pd.DataFrame, max_dist_pct: float = 5.0) -> list[TradeSetup]:
+    """
+    IWM-specific setup evaluation with recalibrated scoring.
+
+    IWM backtest findings (500 days, struct + conv>=4):
+      - 14 trades, 64% WR, PF 1.80 (same-day, hold<=3d, 1.5R target)
+      - Struct-only entries: 50% WR overall, but 70% at conv>=4
+      - PDL/PDH/FVG entries: all negative — hard skip
+      - Entry rvol >= 1.5: 100% WR (3/3) — strongest single factor
+      - Bias vol confirmed: marginal (53% vs 52%) — not scored
+      - Confluence >= 3: helps (57% WR), >= 2 doesn't (50%)
+      - Winners resolve in 1d median; 3-day max hold optimal
+      - Same-day entry: 64% WR vs next-day 45%
+
+    IWM scoring (differs from QQQ):
+      +1 BOS-confirmed bias
+      +1 Structure level retest (hard filter — no other entry types)
+      +1 Entry bar rvol >= 1.5 (100% WR when present)
+      +1 Confluence >= 3 levels within 1% (raised from 2)
+      +1 Short direction during bearish bias (shorts 75% WR at conv>=4)
+      Penalty: -1 CHoCH-only bias, -1 vol divergence against trade
+    """
+    n = len(df)
+    if n < 60:
+        return []
+
+    price = df["close"].iloc[-1]
+    last = df.iloc[-1]
+
+    struct_events = df[df["structure_event"].notna()]
+    if struct_events.empty:
+        return []
+
+    latest_evt = struct_events.iloc[-1]
+    event = latest_evt["structure_event"]
+    bias = "bullish" if "bullish" in event else "bearish"
+    bias_is_bos = "bos" in event
+
+    if not bias_is_bos:
+        for idx in range(len(struct_events) - 2, max(0, len(struct_events) - 6), -1):
+            evt = struct_events.iloc[idx]["structure_event"]
+            if "bos" in evt and (("bullish" in evt) == (bias == "bullish")):
+                bias_is_bos = True
+                break
+
+    cur_rvol = last.get("rvol", 0.0)
+    if np.isnan(cur_rvol):
+        cur_rvol = 0.0
+    cur_vol_div = last.get("vol_divergence", None)
+
+    atr_series = (df["high"] - df["low"]).rolling(14, min_periods=5).mean()
+    cur_atr = atr_series.iloc[-1]
+    if np.isnan(cur_atr):
+        cur_atr = df["high"].iloc[-1] - df["low"].iloc[-1]
+
+    struct_levels = []
+    for _, r in struct_events.tail(10).iterrows():
+        struct_levels.append(r["structure_level"])
+
+    pdh = last.get("pdh", np.nan)
+    pdl = last.get("pdl", np.nan)
+    pwh = last.get("pwh", np.nan)
+    pwl = last.get("pwl", np.nan)
+
+    setups: list[TradeSetup] = []
+
+    for level in struct_levels:
+        if bias == "bearish":
+            dist = (level - price) / price * 100
+            if not (-0.5 <= dist <= max_dist_pct):
+                continue
+            setup = _score_iwm_short(
+                price, level, cur_atr, struct_levels,
+                pdh, pdl, pwh, pwl,
+                bias_is_bos, cur_rvol, cur_vol_div)
+        else:
+            dist = (level - price) / price * 100
+            if not (-max_dist_pct <= dist <= 0.5):
+                continue
+            setup = _score_iwm_long(
+                price, level, cur_atr, struct_levels,
+                pdh, pdl, pwh, pwl,
+                bias_is_bos, cur_rvol, cur_vol_div)
+
+        if setup is not None:
+            setups.append(setup)
+
+    # Deduplicate by level
+    seen = {}
+    for s in setups:
+        key = round(s.entry_top, 2)
+        if key not in seen or s.conviction > seen[key].conviction:
+            seen[key] = s
+    setups = list(seen.values())
+    setups.sort(key=lambda s: -s.conviction)
+    return setups
+
+
+def _iwm_confluence(price, level, struct_levels, pdh, pdl, pwh, pwl):
+    """Count levels stacking within 1% of the target level."""
+    count = 0
+    for sl in struct_levels:
+        if abs(sl - level) / price < 0.01:
+            count += 1
+    for ref in [pdh, pdl, pwh, pwl]:
+        if ref is not None and not np.isnan(ref):
+            if abs(ref - level) / price < 0.01:
+                count += 1
+    return count
+
+
+def _score_iwm_short(price, level, atr, struct_levels,
+                      pdh, pdl, pwh, pwl,
+                      bias_is_bos, cur_rvol, cur_vol_div):
+    reasons = []
+    warnings = []
+    conviction = 0
+
+    confluence = _iwm_confluence(price, level, struct_levels, pdh, pdl, pwh, pwl)
+
+    if bias_is_bos:
+        conviction += 1
+        reasons.append("BOS-confirmed bias")
+    else:
+        warnings.append("CHoCH-only bias (IWM BOS 5d accuracy 51%)")
+
+    conviction += 1
+    reasons.append("Structure level retest (IWM: 70% WR at conv>=4)")
+
+    if cur_rvol >= 1.5:
+        conviction += 1
+        reasons.append(f"Entry rvol={cur_rvol:.1f}x (IWM: 100% WR)")
+
+    if confluence >= 3:
+        conviction += 1
+        reasons.append(f"{confluence} levels stacking (IWM: 57% WR at 3+)")
+    elif confluence >= 2:
+        reasons.append(f"{confluence} levels nearby")
+
+    # Shorts get directional bonus in bearish bias (75% WR at conv>=4)
+    conviction += 1
+    reasons.append("Short w/ bearish bias (IWM: 75% WR at conv>=4)")
+
+    if cur_vol_div == "bullish_div":
+        warnings.append("Bullish volume divergence — seller exhaustion risk")
+        conviction = max(0, conviction - 1)
+    if not bias_is_bos:
+        conviction = max(0, conviction - 1)
+
+    dist = (level - price) / price * 100
+    stop = level + atr * 0.5
+    entry_price = price if dist <= 0 else level
+    risk = stop - entry_price
+    if risk <= 0:
+        return None
+    target = entry_price - risk * 1.5
+
+    return TradeSetup(
+        direction="short",
+        entry_zone=f"STRUCT @ {level:.2f}",
+        entry_top=level, entry_btm=level,
+        stop=round(stop, 2), target=round(target, 2),
+        risk_pct=round(risk / entry_price * 100, 2),
+        reward_pct=round(risk / entry_price * 100 * 1.5, 2),
+        conviction=conviction, reasons=reasons, warnings=warnings,
+        max_hold_days=3,
+    )
+
+
+def _score_iwm_long(price, level, atr, struct_levels,
+                     pdh, pdl, pwh, pwl,
+                     bias_is_bos, cur_rvol, cur_vol_div):
+    reasons = []
+    warnings = []
+    conviction = 0
+
+    confluence = _iwm_confluence(price, level, struct_levels, pdh, pdl, pwh, pwl)
+
+    if bias_is_bos:
+        conviction += 1
+        reasons.append("BOS-confirmed bias")
+    else:
+        warnings.append("CHoCH-only bias (IWM BOS 5d accuracy 51%)")
+
+    conviction += 1
+    reasons.append("Structure level retest (IWM: 70% WR at conv>=4)")
+
+    if cur_rvol >= 1.5:
+        conviction += 1
+        reasons.append(f"Entry rvol={cur_rvol:.1f}x (IWM: 100% WR)")
+
+    if confluence >= 3:
+        conviction += 1
+        reasons.append(f"{confluence} levels stacking (IWM: 57% WR at 3+)")
+    elif confluence >= 2:
+        reasons.append(f"{confluence} levels nearby")
+
+    # Longs don't get directional bonus (shorts stronger for IWM)
+
+    if cur_vol_div == "bearish_div":
+        warnings.append("Bearish volume divergence — buyer exhaustion risk")
+        conviction = max(0, conviction - 1)
+    if not bias_is_bos:
+        conviction = max(0, conviction - 1)
+
+    dist = (level - price) / price * 100
+    stop = level - atr * 0.5
+    entry_price = price if dist >= 0 else level
+    risk = entry_price - stop
+    if risk <= 0:
+        return None
+    target = entry_price + risk * 1.5
+
+    return TradeSetup(
+        direction="long",
+        entry_zone=f"STRUCT @ {level:.2f}",
+        entry_top=level, entry_btm=level,
+        stop=round(stop, 2), target=round(target, 2),
+        risk_pct=round(risk / entry_price * 100, 2),
+        reward_pct=round(risk / entry_price * 100 * 1.5, 2),
+        conviction=conviction, reasons=reasons, warnings=warnings,
+        max_hold_days=3,
+    )
