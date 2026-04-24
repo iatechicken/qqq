@@ -1,243 +1,118 @@
-```md
-# QQQ 1-Minute Data Ingestion (Schwab) → Parquet
+# ICT Trading System — US Stock ETFs
 
-This repo ingests **QQQ 1-minute candles** from the **Schwab Market Data API**, filters to **premarket + RTH (US/Eastern)**, and writes a canonical dataset as **Parquet partitions** by `date_et`.
+Daily ICT (Inner Circle Trader) analysis and backtested trade signals for US stock ETFs, powered by Schwab API data.
 
-It also includes validation utilities to sanity-check Parquet outputs (schema, OHLC integrity, duplicates, missing minutes, gaps, etc.).
+## What It Does
 
----
+- Fetches daily OHLCV candles from the Schwab Market Data API
+- Runs ICT structure analysis: BOS/CHoCH detection, order blocks, FVGs, breakers, displacements, volume divergences
+- Scores trade setups with a conviction system (0-5) validated against a 3-year backtest
+- Produces a daily trading plan across 3 groups with actionable entries, stops, and targets
 
-## Repo Layout
+## Symbol Groups
 
-```
+| Group | Symbols | Edge |
+|-------|---------|------|
+| **Nasdaq** | QQQ, TQQQ, SQQQ | Primary — backtested, calibrated scoring |
+| **Russell** | IWM, TNA, TZA | IWM recalibrated (struct-only, conv>=4, 1.5R, 3d hold) |
+| **Bonds** | TLT, TMF, TMV | Context only — no demonstrated ICT edge |
 
-data/
-candles/
-date_et=YYYY-MM-DD/
-part.parquet
+## Quick Start
 
-logs/
-validate_summary.csv
-backfill_state.json
-
-scripts/
-schwab_oauth_init.py
-run_small_backfill.py
-backfill_18m.py
-update_daily.py
-validate_range.py
-
-src/
-qqq_ingest/
-...
-tokens.json        # local only (DO NOT COMMIT)
-.env               # local only (DO NOT COMMIT)
-
-````
-
-Parquet partitions are written to:
-
-- `data/candles/date_et=YYYY-MM-DD/part.parquet`
-
----
-
-## Requirements
-
-- macOS / Linux terminal
-- Python 3.10+
-- A Schwab developer app with API credentials
-
----
-
-## Setup
-
-### 1) Create and activate a virtual environment
+### 1) Setup
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -U pip
-pip install -r requirements.txt
-````
+pip install -e .
+```
 
-### 2) Create `.env` with Schwab credentials (local only)
+### 2) Schwab OAuth (one-time)
 
-Create a `.env` file in the repo root (make sure `.env` is in `.gitignore`):
+Create `.env` with your Schwab credentials:
 
-```bash
+```
 SCHWAB_CLIENT_ID="YOUR_CLIENT_ID"
 SCHWAB_CLIENT_SECRET="YOUR_CLIENT_SECRET"
 SCHWAB_REDIRECT_URI="https://127.0.0.1"
 ```
 
-> `SCHWAB_REDIRECT_URI` must match the callback URL you registered in the Schwab Developer Portal (exact match).
-
----
-
-## Schwab OAuth (One-Time Init)
-
-Before calling the Market Data endpoints, generate `tokens.json`:
-
-```bash
-source .venv/bin/activate
-python scripts/schwab_oauth_init.py
-```
-
-This script will:
-
-1. print an authorization URL
-2. you open it in a browser and approve access
-3. you paste the final redirect URL back into the script
-4. it writes `tokens.json` in the repo root
-
-### Token notes
-
-* If you start seeing 401/authorization errors, rerun:
+Generate `tokens.json`:
 
 ```bash
 python scripts/schwab_oauth_init.py
 ```
 
----
-
-## Session Window Policy
-
-We ingest **premarket + RTH** and **drop after-hours** by default.
-
-Recommended window for QQQ options workflows:
-
-* **Premarket:** 07:00–09:29 ET
-* **RTH:** 09:30–15:59 ET (390 minutes)
-
-This avoids accidentally treating overnight (e.g., 00:00–07:00) prints as “premarket”.
-
----
-
-## Run Ingestion
-
-### 1) Small backfill test (recommended first)
+### 3) Run Daily Analysis
 
 ```bash
-source .venv/bin/activate
-python scripts/run_small_backfill.py
+python3 scripts/daily_report.py
 ```
 
-Confirm Parquet appears under:
+Auto-detects whether data needs fetching:
+- If parquets already have the last completed trading day → uses cached data
+- If US market is still open → uses cached data (avoids incomplete candles)
+- Otherwise → fetches fresh 24-month candles from Schwab API
 
-* `data/candles/date_et=YYYY-MM-DD/part.parquet`
+Flags: `--load` (force cached), `--fetch` (force fresh), `--months N` (lookback)
 
-### 2) Full backfill (18 months)
-
-This script runs a ~18 month backfill with:
-
-* chunking
-* adaptive chunk shrink on failures
-* checkpointing in `logs/backfill_state.json`
-
-```bash
-source .venv/bin/activate
-python scripts/backfill_18m.py
-```
-
-### 3) Daily incremental update
-
-Pull yesterday + today (recommended once you’re live):
-
-```bash
-source .venv/bin/activate
-python scripts/update_daily.py
-```
-
----
-
-## Validate Parquet Outputs
-
-### Validate the full range
-
-Scans all partitions:
-
-* `data/candles/date_et=*/part.parquet`
-
-Writes:
-
-* `logs/validate_summary.csv`
-
-```bash
-source .venv/bin/activate
-python scripts/validate_range.py
-```
-
-The script prints a list of “Flagged days” based on thresholds.
-
-### Validate a single day (quick ad-hoc)
-
-Example: inspect Jan 8, 2026
-
-```bash
-python - <<'PY'
-import pandas as pd
-DATE="2026-01-08"
-p=f"data/candles/date_et={DATE}/part.parquet"
-df=pd.read_parquet(p).sort_values("ts_et")
-print("rows:", len(df))
-print("sessions:", df["session"].value_counts().to_dict())
-print("range:", df["ts_et"].min(), "->", df["ts_et"].max())
-print(df.head(3))
-PY
-```
-
----
-
-## Interpreting “Flagged Days”
-
-Some flagged days are **expected** because of the US market calendar:
-
-* **Early close** days (e.g., day after Thanksgiving, Christmas Eve) can look like missing RTH minutes if the validator assumes a 16:00 ET close.
-* The **latest date partition** may be incomplete if ingestion runs before the session ends.
-
-If you see large missing blocks on normal trading days, reduce backfill chunk size (or rerun ingestion for that day) and revalidate.
-
----
-
-## Re-running Scripts
-
-From repo root:
-
-```bash
-source .venv/bin/activate
-python scripts/validate_range.py
-```
-
-If you changed ingestion logic:
-
-* rerun `scripts/run_small_backfill.py` (small test)
-* rerun `scripts/backfill_18m.py` (full backfill)
-* rerun `scripts/update_daily.py` (incremental refresh)
-
----
-
-## Git Hygiene / Safety
-
-Do **not** commit:
-
-* `.env`
-* `tokens.json`
-* `data/` outputs
-* `logs/` outputs
-
-Confirm `.gitignore` includes:
+## Repo Layout
 
 ```
-.venv/
-__pycache__/
-*.pyc
-.DS_Store
+scripts/
+  daily_report.py        # Full daily report — all 9 ETFs in one shot
+  ict_daily.py           # QQQ-only ICT analysis (legacy, still works)
+  backtest_ict.py        # ICT backtest engine
+  backtest_trailing.py   # Trailing stop variant (options optimization)
+  schwab_oauth_init.py   # Schwab OAuth token setup
+  backfill_18m.py        # Historical 1-min candle backfill
+  update_daily.py        # Incremental daily update
+  validate_range.py      # Parquet validation
+
+src/qqq_ingest/
+  schwab.py              # Schwab API fetcher (daily + intraday)
+  ict.py                 # ICT analysis engine, setup scoring, IWM calibration
+
 data/
-logs/
-tokens.json
-.env
+  daily_candles.parquet            # QQQ daily candles
+  {symbol}_daily_candles.parquet   # TQQQ, SQQQ, IWM, TNA, TZA, TLT, TMF, TMV
+
+reports/                 # Backtest results and analysis reports
+
+.claude/commands/
+  daily.md               # /daily slash command for Claude Code
 ```
 
-```
-::contentReference[oaicite:0]{index=0}
-```
+## Backtest Results (3-Year, Apr 2023 – Apr 2026)
+
+| Strategy | Trades | Win Rate | Total Return | Profit Factor |
+|----------|--------|----------|-------------|---------------|
+| TQQQ Aggressive (conv>=3) | 16 | 75.0% | +46.20% | 3.05 |
+| SQQQ Conservative (conv>=4) | 7 | 85.7% | +28.04% | 7.18 |
+| QQQ Aggressive (conv>=3) | 23 | 69.6% | +14.12% | 2.55 |
+| IWM Recalibrated (conv>=4) | 14 | 64.0% | +6.82% | 1.80 |
+
+## ICT Conviction Scoring
+
+Each setup is scored 0-5:
+
+- **+1** BOS-confirmed bias (not CHoCH alone)
+- **+1** Bias BOS was volume-confirmed (rvol >= 1.5)
+- **+1** Entry bar rvol >= 1.5
+- **+1** Structure level retest
+- **+1** Confluence >= 2 levels within 1%
+
+IWM uses a different scoring: struct-only entries, confluence >= 3, short direction bonus, no bias vol credit.
+
+## Singapore Timezone Workflow
+
+Designed for traders who can't watch US market close. The system uses bracket orders (limit entry + OCO stop/target) that auto-execute:
+
+1. Run `python3 scripts/daily_report.py` after US close (~5 AM SGT)
+2. Place limit orders at structure levels with bracket (stop + target)
+3. Orders trigger and exit automatically — 91% of trades exit via bracket
+
+## Do Not Commit
+
+- `.env` — Schwab credentials
+- `tokens.json` — OAuth tokens
